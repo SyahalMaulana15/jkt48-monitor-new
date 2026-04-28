@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-JKT48 Ticket Monitor — Railway.app Version
-Berjalan terus-menerus, cek tiket setiap 30 detik.
-Kirim notifikasi Telegram saat quota > 0.
+JKT48 Ticket Monitor — Railway.app Version (Final Fix)
+
+Perbaikan utama:
+- Saat startup, SELALU kirim notif untuk semua slot yang
+  saat ini quota > 0 — tidak peduli apakah itu hasil restock
+  baru atau lama. Ini memastikan tidak ada tiket yang terlewat
+  meski Railway restart di tengah-tengah restock.
+- Header browser lengkap agar tidak diblokir server JKT48
+- Retry otomatis 3x saat API timeout
+- Alert Telegram jika API gagal berkali-kali
+- Heartbeat setiap 6 jam
 """
 
 import requests
-import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
@@ -17,16 +24,13 @@ from datetime import datetime, timezone, timedelta
 
 API_URL        = "https://jkt48.com/api/v1/exclusives/EX579E/bonus?lang=id"
 EXCLUSIVE_CODE = "EX579E"
-STATE_FILE     = "/tmp/state.json"  # Railway pakai /tmp untuk file sementara
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Interval pengecekan (detik)
-CHECK_INTERVAL = 30
-
-# Interval heartbeat (jam)
-HEARTBEAT_EVERY_HOURS = 6
+CHECK_INTERVAL        = 30  # detik antar pengecekan
+HEARTBEAT_EVERY_HOURS = 6   # jam antar laporan berkala
+MAX_FAIL_ALERT        = 5   # berapa kali gagal sebelum kirim alert
 
 # Kosongkan [] untuk pantau SEMUA member
 # Contoh: WATCH_MEMBERS = ["Shabilqis Naila", "Freya Jayawardana"]
@@ -67,53 +71,82 @@ def send_telegram(message: str) -> bool:
         return False
 
 # ─────────────────────────────────────────────
-#  STATE
+#  FETCH API
 # ─────────────────────────────────────────────
 
-def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://jkt48.com/",
+    "Origin": "https://jkt48.com",
+    "Connection": "keep-alive",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
 
-def save_state(state: dict):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception as e:
-        print(f"  ⚠ Gagal simpan state: {e}")
+def fetch_tickets(retries: int = 3) -> list | None:
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(API_URL, headers=BROWSER_HEADERS, timeout=20)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("status") and "data" in data:
+                return data["data"]
+            print(f"  ⚠ Respons tidak terduga: {data.get('message')}")
+            return None
+        except Exception as e:
+            if attempt < retries:
+                wait = attempt * 5
+                print(f"  ⚠ Attempt {attempt}/{retries} gagal — retry dalam {wait}s: {e}")
+                time.sleep(wait)
+            else:
+                print(f"  ❌ Gagal fetch API setelah {retries}x: {e}")
+                return None
+
+# ─────────────────────────────────────────────
+#  EXTRACT QUOTA
+# ─────────────────────────────────────────────
+
+def extract_quota(sessions: list) -> dict:
+    result = {}
+    for sesi in sessions:
+        for member in sesi.get("session_members", []):
+            detail_id = str(member.get("session_detail_id", ""))
+            result[detail_id] = member.get("quota", 0)
+    return result
 
 # ─────────────────────────────────────────────
 #  HEARTBEAT
 # ─────────────────────────────────────────────
 
-def should_send_heartbeat(state: dict) -> bool:
-    last_hb = state.get("last_heartbeat")
-    if not last_hb:
+def should_send_heartbeat(last_hb: datetime | None) -> bool:
+    if last_hb is None:
         return True
-    try:
-        last_dt = datetime.fromisoformat(last_hb)
-        elapsed = now_wib() - last_dt
-        return elapsed.total_seconds() >= HEARTBEAT_EVERY_HOURS * 3600
-    except Exception:
-        return True
+    return (now_wib() - last_hb).total_seconds() >= HEARTBEAT_EVERY_HOURS * 3600
 
-def send_heartbeat(state: dict, sessions: list, total_slots: int):
-    now = now_wib()
-    available = sum(
+def send_heartbeat(sessions: list, run_count: int) -> datetime:
+    now         = now_wib()
+    total_slots = sum(len(s.get("session_members", [])) for s in sessions)
+    available   = sum(
         1 for s in sessions
         for m in s.get("session_members", [])
         if m.get("quota", 0) > 0
     )
-    run_count = state.get("run_count", 0)
-    next_hb   = now + timedelta(hours=HEARTBEAT_EVERY_HOURS)
-    status_line = "😴 Semua slot masih sold out" if available == 0 \
-        else f"🎉 {available} slot tersedia!"
+    next_hb = now + timedelta(hours=HEARTBEAT_EVERY_HOURS)
+    status  = "😴 Semua slot masih sold out" if available == 0 \
+              else f"🎉 {available} slot tersedia!"
 
-    msg = (
+    send_telegram(
         f"💓 <b>Laporan Berkala — JKT48 Monitor</b>\n\n"
         f"✅ Sistem berjalan normal\n"
         f"🕐 Waktu: {now.strftime('%Y-%m-%d %H:%M WIB')}\n"
@@ -122,113 +155,85 @@ def send_heartbeat(state: dict, sessions: list, total_slots: int):
         f"   • Total slot dipantau: {total_slots}\n"
         f"   • Sold out: {total_slots - available}\n"
         f"   • Tersedia: {available}\n\n"
-        f"{status_line}\n\n"
+        f"{status}\n\n"
         f"🔁 Laporan berikutnya: {next_hb.strftime('%H:%M WIB')}\n"
         f"📈 Total pengecekan: {run_count:,}x"
     )
-    print("  💓 Mengirim heartbeat...")
-    send_telegram(msg)
-    state["last_heartbeat"] = now.isoformat()
+    print("  💓 Heartbeat terkirim")
+    return now
 
 # ─────────────────────────────────────────────
-#  FETCH API
+#  STARTUP — fetch + langsung notif jika ada
+#  tiket tersedia saat ini
 # ─────────────────────────────────────────────
 
-def fetch_tickets() -> list | None:
-    try:
-        r = requests.get(API_URL, timeout=10,
-                         headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") and "data" in data:
-            return data["data"]
-        print(f"  ⚠ Respons tidak terduga: {data.get('message')}")
-        return None
-    except Exception as e:
-        print(f"  ❌ Gagal fetch API: {e}")
-        return None
+def init_and_notify() -> tuple[dict, list]:
+    """
+    Fetch API saat startup.
+    LANGSUNG kirim notif untuk semua slot yang quota > 0.
+    Ini memastikan tidak ada restock yang terlewat
+    meski terjadi saat Railway sedang restart.
+    """
+    print("🔄 Inisialisasi — mengambil data awal dari API...")
+    while True:
+        sessions = fetch_tickets()
+        if sessions is not None:
+            break
+        print("  ⚠ API belum merespons, retry dalam 10 detik...")
+        time.sleep(10)
 
-# ─────────────────────────────────────────────
-#  SATU SIKLUS CEK
-# ─────────────────────────────────────────────
+    quota       = extract_quota(sessions)
+    total       = len(quota)
+    available   = [k for k, v in quota.items() if v > 0]
+    purchase_url = f"https://jkt48.com/purchase/exclusive?code={EXCLUSIVE_CODE}"
 
-def check_once(state: dict) -> dict:
-    state["run_count"] = state.get("run_count", 0) + 1
-    run = state["run_count"]
+    print(f"  ✅ Data awal: {total} slot, {len(available)} tersedia, {total - len(available)} sold out")
 
-    sessions = fetch_tickets()
-    if sessions is None:
-        print(f"  ⚠ Skip cek #{run} — API tidak merespons")
-        return state
+    # Kirim notif untuk semua slot yang SEKARANG tersedia
+    if available:
+        print(f"  🎉 Ditemukan {len(available)} slot tersedia saat startup — mengirim notif...")
+        for sesi in sessions:
+            sesi_label = sesi.get("label", "?")
+            sesi_time  = sesi.get("start_time", "")[:5]
+            for member in sesi.get("session_members", []):
+                if WATCH_MEMBERS and member.get("member_name", "") not in WATCH_MEMBERS:
+                    continue
+                detail_id = str(member.get("session_detail_id", ""))
+                quota_val = member.get("quota", 0)
+                if quota_val > 0:
+                    name  = member.get("member_name", "")
+                    jalur = member.get("label", "")
+                    price = member.get("price", 0)
+                    send_telegram(
+                        f"🎉 <b>TIKET TERSEDIA!</b>\n"
+                        f"<i>(terdeteksi saat sistem restart)</i>\n\n"
+                        f"👤 <b>Member:</b> {name}\n"
+                        f"📋 <b>Sesi:</b> {sesi_label} ({sesi_time} WIB)\n"
+                        f"🚪 <b>Jalur:</b> {jalur}\n"
+                        f"🎟 <b>Quota:</b> {quota_val} tiket\n"
+                        f"💰 <b>Harga:</b> Rp{price:,}\n"
+                        f"🕐 <b>Terdeteksi:</b> {now_str()}\n\n"
+                        f"🔗 <a href='{purchase_url}'>Beli sekarang →</a>"
+                    )
+    else:
+        print("  😴 Tidak ada slot tersedia saat startup")
 
-    prev_quota  = state.get("quota", {})
-    new_quota   = {}
-    notif_count = 0
-    total_slots = 0
-
-    for sesi in sessions:
-        sesi_label = sesi.get("label", "?")
-        sesi_time  = sesi.get("start_time", "")[:5]
-
-        for member in sesi.get("session_members", []):
-            name      = member.get("member_name", "")
-            jalur     = member.get("label", "")
-            quota     = member.get("quota", 0)
-            price     = member.get("price", 0)
-            detail_id = str(member.get("session_detail_id", ""))
-            total_slots += 1
-
-            if WATCH_MEMBERS and name not in WATCH_MEMBERS:
-                new_quota[detail_id] = quota
-                continue
-
-            prev = prev_quota.get(detail_id, 0)
-            new_quota[detail_id] = quota
-
-            # Sold out → Tersedia
-            if quota > 0 and prev == 0:
-                now = now_str()
-                print(f"  🎉 TERSEDIA: {name} | {sesi_label} ({sesi_time}) | {jalur} | quota={quota}")
-                purchase_url = f"https://jkt48.com/purchase/exclusive?code={EXCLUSIVE_CODE}"
-                msg = (
-                    f"🎉 <b>TIKET TERSEDIA!</b>\n\n"
-                    f"👤 <b>Member:</b> {name}\n"
-                    f"📋 <b>Sesi:</b> {sesi_label} ({sesi_time} WIB)\n"
-                    f"🚪 <b>Jalur:</b> {jalur}\n"
-                    f"🎟 <b>Quota:</b> {quota} tiket\n"
-                    f"💰 <b>Harga:</b> Rp{price:,}\n"
-                    f"🕐 <b>Terdeteksi:</b> {now}\n\n"
-                    f"🔗 <a href='{purchase_url}'>Beli sekarang →</a>"
-                )
-                send_telegram(msg)
-                notif_count += 1
-
-            # Tersedia → Sold out
-            elif quota == 0 and prev > 0:
-                print(f"  ❌ Kembali sold out: {name} | {sesi_label} | {jalur}")
-
-    state["quota"] = new_quota
-
-    # Cek heartbeat
-    if should_send_heartbeat(state):
-        send_heartbeat(state, sessions, total_slots)
-
-    if notif_count > 0:
-        print(f"  📨 {notif_count} notifikasi dikirim")
-
-    return state
+    return quota, sessions
 
 # ─────────────────────────────────────────────
 #  MAIN LOOP
 # ─────────────────────────────────────────────
 
 def main():
-    print("=" * 50)
-    print("JKT48 Ticket Monitor — Railway.app")
+    print("=" * 55)
+    print("JKT48 Ticket Monitor — Railway.app (Final Fix)")
     print(f"Interval : {CHECK_INTERVAL} detik")
     print(f"Heartbeat: setiap {HEARTBEAT_EVERY_HOURS} jam")
     print(f"Member   : {'semua' if not WATCH_MEMBERS else ', '.join(WATCH_MEMBERS)}")
-    print("=" * 50)
+    print("=" * 55)
+
+    # Inisialisasi + langsung notif jika ada tiket tersedia
+    prev_quota, last_sessions = init_and_notify()
 
     # Pesan startup ke Telegram
     send_telegram(
@@ -238,25 +243,79 @@ def main():
         f"🕐 Mulai: {now_str()}"
     )
 
-    state = load_state()
+    run_count      = 0
+    fail_count     = 0
+    last_heartbeat = now_wib()
 
     while True:
-        now = now_wib().strftime("%H:%M:%S")
-        run_next = state.get("run_count", 0) + 1
-        print(f"[{now}] Cek #{run_next}...", end=" ", flush=True)
-
-        try:
-            state = check_once(state)
-            save_state(state)
-            # Cetak ringkasan setiap 10 run
-            if state["run_count"] % 10 == 0:
-                print(f"\n  📊 Total {state['run_count']}x cek berjalan lancar")
-            else:
-                print("selesai")
-        except Exception as e:
-            print(f"\n  ❌ Error tidak terduga: {e}")
-
         time.sleep(CHECK_INTERVAL)
+        run_count += 1
+        ts = now_wib().strftime("%H:%M:%S")
+        print(f"[{ts}] Cek #{run_count}...", end=" ", flush=True)
+
+        sessions = fetch_tickets()
+
+        if sessions is None:
+            fail_count += 1
+            print(f"gagal ({fail_count}x berturut-turut)")
+            if fail_count == MAX_FAIL_ALERT:
+                send_telegram(
+                    f"⚠️ <b>JKT48 Monitor — API Bermasalah</b>\n\n"
+                    f"Gagal mengakses API JKT48 sebanyak {MAX_FAIL_ALERT}x berturut-turut.\n"
+                    f"🕐 {now_str()}\n\n"
+                    f"Monitor tetap mencoba setiap {CHECK_INTERVAL} detik."
+                )
+            continue
+
+        fail_count  = 0
+        new_quota   = extract_quota(sessions)
+        notif_count = 0
+        purchase_url = f"https://jkt48.com/purchase/exclusive?code={EXCLUSIVE_CODE}"
+
+        for sesi in sessions:
+            sesi_label = sesi.get("label", "?")
+            sesi_time  = sesi.get("start_time", "")[:5]
+
+            for member in sesi.get("session_members", []):
+                name      = member.get("member_name", "")
+                jalur     = member.get("label", "")
+                quota     = member.get("quota", 0)
+                price     = member.get("price", 0)
+                detail_id = str(member.get("session_detail_id", ""))
+
+                if WATCH_MEMBERS and name not in WATCH_MEMBERS:
+                    continue
+
+                prev = prev_quota.get(detail_id, 0)
+
+                # Sold out → Tersedia
+                if quota > 0 and prev == 0:
+                    print(f"\n  🎉 TERSEDIA: {name} | {sesi_label} ({sesi_time}) | {jalur} | quota={quota}")
+                    send_telegram(
+                        f"🎉 <b>TIKET TERSEDIA!</b>\n\n"
+                        f"👤 <b>Member:</b> {name}\n"
+                        f"📋 <b>Sesi:</b> {sesi_label} ({sesi_time} WIB)\n"
+                        f"🚪 <b>Jalur:</b> {jalur}\n"
+                        f"🎟 <b>Quota:</b> {quota} tiket\n"
+                        f"💰 <b>Harga:</b> Rp{price:,}\n"
+                        f"🕐 <b>Terdeteksi:</b> {now_str()}\n\n"
+                        f"🔗 <a href='{purchase_url}'>Beli sekarang →</a>"
+                    )
+                    notif_count += 1
+
+                # Tersedia → Sold out
+                elif quota == 0 and prev > 0:
+                    print(f"\n  ❌ Sold out: {name} | {sesi_label} | {jalur}")
+
+        prev_quota = new_quota
+
+        if should_send_heartbeat(last_heartbeat):
+            last_heartbeat = send_heartbeat(sessions, run_count)
+
+        if notif_count > 0:
+            print(f"  📨 {notif_count} notifikasi dikirim")
+        else:
+            print("OK" if run_count % 10 != 0 else f"OK (total {run_count}x cek)")
 
 if __name__ == "__main__":
     main()
