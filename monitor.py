@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-JKT48 Ticket Monitor — Railway.app Version (Final Fix)
+JKT48 Ticket Monitor — Railway.app Version (Final Fix v2)
 
-Perbaikan utama:
-- Saat startup, SELALU kirim notif untuk semua slot yang
-  saat ini quota > 0 — tidak peduli apakah itu hasil restock
-  baru atau lama. Ini memastikan tidak ada tiket yang terlewat
-  meski Railway restart di tengah-tengah restock.
-- Header browser lengkap agar tidak diblokir server JKT48
-- Retry otomatis 3x saat API timeout
-- Alert Telegram jika API gagal berkali-kali
+Perbaikan:
+- Handle respons kosong/HTML dari API (bukan hanya timeout)
+- Jeda retry lebih panjang (15s/30s/45s) agar tidak diblokir
+- Notif langsung saat startup jika ada tiket tersedia
+- Header browser lengkap
 - Heartbeat setiap 6 jam
 """
 
@@ -99,15 +96,28 @@ def fetch_tickets(retries: int = 3) -> list | None:
         try:
             r = requests.get(API_URL, headers=BROWSER_HEADERS, timeout=20)
             r.raise_for_status()
+
+            # Validasi respons sebelum parse JSON
+            # Jika server mengembalikan HTML/kosong, tangkap sebelum crash
+            text = r.text.strip()
+            if not text:
+                raise ValueError("Respons kosong dari server")
+            if not text.startswith("{") and not text.startswith("["):
+                raise ValueError(f"Respons bukan JSON: {text[:100]!r}")
+
             data = r.json()
             if data.get("status") and "data" in data:
                 return data["data"]
             print(f"  ⚠ Respons tidak terduga: {data.get('message')}")
             return None
+
         except Exception as e:
+            # Jeda makin panjang tiap retry: 15s → 30s → 45s
+            # agar tidak langsung diblokir server
+            wait = attempt * 15
             if attempt < retries:
-                wait = attempt * 5
-                print(f"  ⚠ Attempt {attempt}/{retries} gagal — retry dalam {wait}s: {e}")
+                print(f"  ⚠ Attempt {attempt}/{retries} gagal — retry dalam {wait}s")
+                print(f"     Error: {e}")
                 time.sleep(wait)
             else:
                 print(f"  ❌ Gagal fetch API setelah {retries}x: {e}")
@@ -129,7 +139,7 @@ def extract_quota(sessions: list) -> dict:
 #  HEARTBEAT
 # ─────────────────────────────────────────────
 
-def should_send_heartbeat(last_hb: datetime | None) -> bool:
+def should_send_heartbeat(last_hb) -> bool:
     if last_hb is None:
         return True
     return (now_wib() - last_hb).total_seconds() >= HEARTBEAT_EVERY_HOURS * 3600
@@ -145,7 +155,6 @@ def send_heartbeat(sessions: list, run_count: int) -> datetime:
     next_hb = now + timedelta(hours=HEARTBEAT_EVERY_HOURS)
     status  = "😴 Semua slot masih sold out" if available == 0 \
               else f"🎉 {available} slot tersedia!"
-
     send_telegram(
         f"💓 <b>Laporan Berkala — JKT48 Monitor</b>\n\n"
         f"✅ Sistem berjalan normal\n"
@@ -167,43 +176,38 @@ def send_heartbeat(sessions: list, run_count: int) -> datetime:
 #  tiket tersedia saat ini
 # ─────────────────────────────────────────────
 
-def init_and_notify() -> tuple[dict, list]:
-    """
-    Fetch API saat startup.
-    LANGSUNG kirim notif untuk semua slot yang quota > 0.
-    Ini memastikan tidak ada restock yang terlewat
-    meski terjadi saat Railway sedang restart.
-    """
+def init_and_notify() -> tuple:
     print("🔄 Inisialisasi — mengambil data awal dari API...")
     while True:
         sessions = fetch_tickets()
         if sessions is not None:
             break
-        print("  ⚠ API belum merespons, retry dalam 10 detik...")
-        time.sleep(10)
+        print("  ⚠ API belum merespons, retry dalam 15 detik...")
+        time.sleep(15)
 
-    quota       = extract_quota(sessions)
-    total       = len(quota)
-    available   = [k for k, v in quota.items() if v > 0]
+    quota        = extract_quota(sessions)
+    total        = len(quota)
+    available    = [k for k, v in quota.items() if v > 0]
     purchase_url = f"https://jkt48.com/purchase/exclusive?code={EXCLUSIVE_CODE}"
 
     print(f"  ✅ Data awal: {total} slot, {len(available)} tersedia, {total - len(available)} sold out")
 
     # Kirim notif untuk semua slot yang SEKARANG tersedia
     if available:
-        print(f"  🎉 Ditemukan {len(available)} slot tersedia saat startup — mengirim notif...")
+        print(f"  🎉 {len(available)} slot tersedia saat startup — mengirim notif...")
         for sesi in sessions:
             sesi_label = sesi.get("label", "?")
             sesi_time  = sesi.get("start_time", "")[:5]
             for member in sesi.get("session_members", []):
-                if WATCH_MEMBERS and member.get("member_name", "") not in WATCH_MEMBERS:
-                    continue
-                detail_id = str(member.get("session_detail_id", ""))
+                name      = member.get("member_name", "")
+                jalur     = member.get("label", "")
                 quota_val = member.get("quota", 0)
+                price     = member.get("price", 0)
+                detail_id = str(member.get("session_detail_id", ""))
+
+                if WATCH_MEMBERS and name not in WATCH_MEMBERS:
+                    continue
                 if quota_val > 0:
-                    name  = member.get("member_name", "")
-                    jalur = member.get("label", "")
-                    price = member.get("price", 0)
                     send_telegram(
                         f"🎉 <b>TIKET TERSEDIA!</b>\n"
                         f"<i>(terdeteksi saat sistem restart)</i>\n\n"
@@ -226,16 +230,14 @@ def init_and_notify() -> tuple[dict, list]:
 
 def main():
     print("=" * 55)
-    print("JKT48 Ticket Monitor — Railway.app (Final Fix)")
+    print("JKT48 Ticket Monitor — Railway.app (Final Fix v2)")
     print(f"Interval : {CHECK_INTERVAL} detik")
     print(f"Heartbeat: setiap {HEARTBEAT_EVERY_HOURS} jam")
     print(f"Member   : {'semua' if not WATCH_MEMBERS else ', '.join(WATCH_MEMBERS)}")
     print("=" * 55)
 
-    # Inisialisasi + langsung notif jika ada tiket tersedia
     prev_quota, last_sessions = init_and_notify()
 
-    # Pesan startup ke Telegram
     send_telegram(
         f"✅ <b>JKT48 Monitor aktif!</b>\n\n"
         f"⚡ Cek tiket setiap <b>{CHECK_INTERVAL} detik</b>\n"
@@ -267,9 +269,9 @@ def main():
                 )
             continue
 
-        fail_count  = 0
-        new_quota   = extract_quota(sessions)
-        notif_count = 0
+        fail_count   = 0
+        new_quota    = extract_quota(sessions)
+        notif_count  = 0
         purchase_url = f"https://jkt48.com/purchase/exclusive?code={EXCLUSIVE_CODE}"
 
         for sesi in sessions:
