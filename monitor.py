@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-JKT48 Ticket Monitor — Railway.app Version (Final Fix v3)
+JKT48 Ticket Monitor — Railway.app Version (Final Fix v4)
+- Interval cek: 10 detik
+- Fetch lebih tahan error: retry cepat tanpa delay panjang
+- Jika fetch gagal, langsung coba lagi di siklus berikutnya
+- Notif langsung saat startup jika ada tiket tersedia
+- Header browser tanpa Accept-Encoding
+- Heartbeat setiap 6 jam
 """
 
 import requests
@@ -18,9 +24,9 @@ EXCLUSIVE_CODE = "EX579E"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-CHECK_INTERVAL        = 30
+CHECK_INTERVAL        = 10   # detik — dipercepat dari 30 → 10
 HEARTBEAT_EVERY_HOURS = 6
-MAX_FAIL_ALERT        = 5
+MAX_FAIL_ALERT        = 10   # dinaikkan karena interval lebih cepat
 
 WATCH_MEMBERS = []
 
@@ -60,8 +66,10 @@ def send_telegram(message: str) -> bool:
 
 # ─────────────────────────────────────────────
 #  FETCH API
-#  - Tanpa Accept-Encoding agar server kirim
-#    plain text, bukan gzip/brotli
+#  - Timeout 8 detik (lebih pendek dari interval)
+#  - Retry 2x dengan jeda singkat (3 detik)
+#  - Tanpa Accept-Encoding agar tidak dapat
+#    respons terkompresi
 # ─────────────────────────────────────────────
 
 HEADERS = {
@@ -72,8 +80,6 @@ HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
-    # Accept-Encoding sengaja TIDAK diset
-    # agar server tidak mengirim data terkompresi
     "Referer": "https://jkt48.com/",
     "Origin": "https://jkt48.com",
     "Connection": "keep-alive",
@@ -82,39 +88,32 @@ HEADERS = {
     "Sec-Fetch-Site": "same-origin",
 }
 
-def fetch_tickets(retries: int = 3) -> list | None:
+def fetch_tickets(retries: int = 2) -> list | None:
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(
-                API_URL,
-                headers=HEADERS,
-                timeout=20,
-            )
+            r = requests.get(API_URL, headers=HEADERS, timeout=8)
             r.raise_for_status()
 
-            # Decode manual jika perlu
             text = r.content.decode("utf-8", errors="replace").strip()
-
             if not text:
-                raise ValueError("Respons kosong dari server")
+                raise ValueError("Respons kosong")
             if not text.startswith("{") and not text.startswith("["):
-                raise ValueError(f"Bukan JSON: {text[:80]!r}")
+                raise ValueError(f"Bukan JSON: {text[:60]!r}")
 
             data = r.json()
             if data.get("status") and "data" in data:
                 return data["data"]
-
             print(f"  ⚠ Respons tidak terduga: {data.get('message')}")
             return None
 
         except Exception as e:
-            wait = attempt * 15
             if attempt < retries:
-                print(f"  ⚠ Attempt {attempt}/{retries} gagal — retry dalam {wait}s")
-                print(f"     Error: {e}")
-                time.sleep(wait)
+                # Jeda singkat 3 detik lalu langsung retry
+                # agar tidak buang waktu terlalu lama
+                print(f"  ⚠ Attempt {attempt}/{retries} gagal, retry 3s: {e}")
+                time.sleep(3)
             else:
-                print(f"  ❌ Gagal fetch API setelah {retries}x: {e}")
+                print(f"  ❌ Gagal fetch: {e}")
                 return None
 
 # ─────────────────────────────────────────────
@@ -138,7 +137,7 @@ def should_send_heartbeat(last_hb) -> bool:
         return True
     return (now_wib() - last_hb).total_seconds() >= HEARTBEAT_EVERY_HOURS * 3600
 
-def send_heartbeat(sessions: list, run_count: int) -> datetime:
+def send_heartbeat(sessions: list, run_count: int, fail_total: int) -> datetime:
     now         = now_wib()
     total_slots = sum(len(s.get("session_members", [])) for s in sessions)
     available   = sum(
@@ -159,8 +158,9 @@ def send_heartbeat(sessions: list, run_count: int) -> datetime:
         f"   • Sold out: {total_slots - available}\n"
         f"   • Tersedia: {available}\n\n"
         f"{status}\n\n"
-        f"🔁 Laporan berikutnya: {next_hb.strftime('%H:%M WIB')}\n"
-        f"📈 Total pengecekan: {run_count:,}x"
+        f"📈 Total pengecekan: {run_count:,}x\n"
+        f"⚠️ Total gagal fetch: {fail_total}x\n"
+        f"🔁 Laporan berikutnya: {next_hb.strftime('%H:%M WIB')}"
     )
     print("  💓 Heartbeat terkirim")
     return now
@@ -175,8 +175,8 @@ def init_and_notify() -> tuple:
         sessions = fetch_tickets()
         if sessions is not None:
             break
-        print("  ⚠ API belum merespons, retry dalam 15 detik...")
-        time.sleep(15)
+        print("  ⚠ API belum merespons, retry dalam 5 detik...")
+        time.sleep(5)
 
     quota        = extract_quota(sessions)
     total        = len(quota)
@@ -220,7 +220,7 @@ def init_and_notify() -> tuple:
 
 def main():
     print("=" * 55)
-    print("JKT48 Ticket Monitor — Railway.app (Final Fix v3)")
+    print("JKT48 Ticket Monitor — Railway.app (Final Fix v4)")
     print(f"Interval : {CHECK_INTERVAL} detik")
     print(f"Heartbeat: setiap {HEARTBEAT_EVERY_HOURS} jam")
     print(f"Member   : {'semua' if not WATCH_MEMBERS else ', '.join(WATCH_MEMBERS)}")
@@ -237,6 +237,7 @@ def main():
 
     run_count      = 0
     fail_count     = 0
+    fail_total     = 0
     last_heartbeat = now_wib()
     last_sessions  = []
 
@@ -250,11 +251,12 @@ def main():
 
         if sessions is None:
             fail_count += 1
+            fail_total += 1
             print(f"gagal ({fail_count}x berturut-turut)")
             if fail_count == MAX_FAIL_ALERT:
                 send_telegram(
                     f"⚠️ <b>JKT48 Monitor — API Bermasalah</b>\n\n"
-                    f"Gagal mengakses API JKT48 sebanyak {MAX_FAIL_ALERT}x berturut-turut.\n"
+                    f"Gagal mengakses API JKT48 sebanyak {MAX_FAIL_ALERT}x berturut-turut (~{MAX_FAIL_ALERT * CHECK_INTERVAL} detik).\n"
                     f"🕐 {now_str()}\n\n"
                     f"Monitor tetap mencoba setiap {CHECK_INTERVAL} detik."
                 )
@@ -282,6 +284,7 @@ def main():
 
                 prev = prev_quota.get(detail_id, 0)
 
+                # Sold out → Tersedia
                 if quota > 0 and prev == 0:
                     print(f"\n  🎉 TERSEDIA: {name} | {sesi_label} ({sesi_time}) | {jalur} | quota={quota}")
                     send_telegram(
@@ -296,18 +299,19 @@ def main():
                     )
                     notif_count += 1
 
+                # Tersedia → Sold out
                 elif quota == 0 and prev > 0:
                     print(f"\n  ❌ Sold out: {name} | {sesi_label} | {jalur}")
 
         prev_quota = new_quota
 
         if should_send_heartbeat(last_heartbeat):
-            last_heartbeat = send_heartbeat(sessions, run_count)
+            last_heartbeat = send_heartbeat(sessions, run_count, fail_total)
 
         if notif_count > 0:
             print(f"  📨 {notif_count} notifikasi dikirim")
         else:
-            print("OK" if run_count % 10 != 0 else f"OK (total {run_count}x cek)")
+            print("OK" if run_count % 20 != 0 else f"OK (total {run_count}x cek)")
 
 if __name__ == "__main__":
     main()
